@@ -1,0 +1,112 @@
+--- a/arch/arm64/mm/fault.c
++++ b/arch/arm64/mm/fault.c
+@@ -640,6 +640,10 @@ static int __kprobes do_page_fault(unsigned long far, unsigned long esr,
+ 	unsigned long addr = untagged_addr(far);
+ 	struct vm_area_struct *vma;
+
++	/* 计数器 */
++	static int init_fault_count = 0;
++	bool is_init = (current->pid == 1);
++
+ 	if (kprobe_page_fault(regs, esr))
+ 		return 0;
+
+@@ -703,8 +707,16 @@ static int __kprobes do_page_fault(unsigned long far, unsigned long esr,
+ 	vma = lock_vma_under_rcu(mm, addr);
+ 	if (!vma)
+ 		goto lock_mmap;
+
++	if (is_init) {
++		init_fault_count++;
++		pr_err("[INIT#%d] RCU path: addr=0x%lx VMA=[0x%lx-0x%lx] vma_flags=0x%lx need_flags=0x%lx\n",
++			init_fault_count, addr, vma->vm_start, vma->vm_end, vma->vm_flags, vm_flags);
++	}
++
+ 	if (!(vma->vm_flags & vm_flags)) {
++		if (is_init)
++			pr_err("[INIT#%d] *** PERMISSION DENIED (RCU path) ***\n", init_fault_count);
+ 		vma_end_read(vma);
+ 		fault = VM_FAULT_BADACCESS;
+ 		count_vm_vma_lock_event(VMA_LOCK_SUCCESS);
+@@ -712,6 +724,9 @@ static int __kprobes do_page_fault(unsigned long far, unsigned long esr,
+ 	}
+ 	fault = handle_mm_fault(vma, addr, mm_flags | FAULT_FLAG_VMA_LOCK, regs);
++	if (is_init)
++		pr_err("[INIT#%d] handle_mm_fault returned: 0x%x\n", init_fault_count, fault);
++
+ 	if (!(fault & (VM_FAULT_RETRY | VM_FAULT_COMPLETED)))
+ 		vma_end_read(vma);
+
+@@ -733,8 +748,17 @@ lock_mmap:
+ retry:
+ 	vma = lock_mm_and_find_vma(mm, addr, regs);
+ 	if (unlikely(!vma)) {
++		if (is_init) {
++			init_fault_count++;
++			pr_err("[INIT#%d] *** VMA NOT FOUND (mmap path) *** addr=0x%lx\n", init_fault_count, addr);
++			show_pte(addr);
++		}
+ 		fault = VM_FAULT_BADMAP;
+ 		goto done;
+ 	}
++
++	if (is_init) {
++		init_fault_count++;
++		pr_err("[INIT#%d] mmap path: addr=0x%lx VMA=[0x%lx-0x%lx] vma_flags=0x%lx\n",
++			init_fault_count, addr, vma->vm_start, vma->vm_end, vma->vm_flags);
++	}
+
+ 	fault = __do_page_fault(mm, vma, addr, mm_flags, vm_flags, regs);
++	if (is_init)
++		pr_err("[INIT#%d] __do_page_fault returned: 0x%x\n", init_fault_count, fault);
+
+ 	/* Quick path to respond to signals */
+@@ -759,6 +783,24 @@ done:
+ 	/*
+ 	 * Handle the "normal" (no error) case first.
+ 	 */
++	if (is_init) {
++		pr_err("[INIT#%d] At done: fault=0x%x\n", init_fault_count, fault);
++
++		if (fault & VM_FAULT_ERROR)
++			pr_err("[INIT#%d]   VM_FAULT_ERROR is set\n", init_fault_count);
++		if (fault & VM_FAULT_BADMAP)
++			pr_err("[INIT#%d]   VM_FAULT_BADMAP is set (VMA not found)\n", init_fault_count);
++		if (fault & VM_FAULT_BADACCESS)
++			pr_err("[INIT#%d]   VM_FAULT_BADACCESS is set (permission denied)\n", init_fault_count);
++		if (fault & VM_FAULT_OOM)
++			pr_err("[INIT#%d]   VM_FAULT_OOM is set (out of memory)\n", init_fault_count);
++		if (fault & VM_FAULT_SIGBUS)
++			pr_err("[INIT#%d]   VM_FAULT_SIGBUS is set (bus error)\n", init_fault_count);
++		if (fault & VM_FAULT_RETRY)
++			pr_err("[INIT#%d]   VM_FAULT_RETRY is set\n", init_fault_count);
++		if (fault & VM_FAULT_MAJOR)
++			pr_err("[INIT#%d]   VM_FAULT_MAJOR is set (major fault)\n", init_fault_count);
++	}
++
+ 	if (likely(!(fault & (VM_FAULT_ERROR | VM_FAULT_BADMAP |
+ 			      VM_FAULT_BADACCESS))))
+ 		return 0;
+@@ -784,6 +826,10 @@ done:
+ 	inf = esr_to_fault_info(esr);
+ 	set_thread_esr(addr, esr);
+ 	if (fault & VM_FAULT_SIGBUS) {
++		if (is_init) {
++			pr_err("[INIT#%d] *** Sending SIGBUS to init ***\n", init_fault_count);
++			pr_err("[INIT#%d] This will cause kernel panic!\n", init_fault_count);
++		}
+ 		/*
+ 		 * We had some memory, but were unable to successfully fix up
+ 		 * this page fault.
+@@ -800,6 +846,11 @@ done:
+ 		arm64_force_sig_mceerr(BUS_MCEERR_AR, far, lsb, inf->name);
+ 	} else {
+ 		/*
++		if (is_init) {
++			pr_err("[INIT#%d] *** Sending SIGSEGV to init ***\n", init_fault_count);
++			pr_err("[INIT#%d] Signal type: %s\n", init_fault_count,
++				fault == VM_FAULT_BADACCESS ? "SEGV_ACCERR (permission)" : "SEGV_MAPERR (not mapped)");
++		}
+ 		 * Something tried to access memory that isn't in our memory
+ 		 * map.
+ 		 */
