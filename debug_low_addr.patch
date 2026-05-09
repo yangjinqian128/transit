@@ -1,0 +1,59 @@
+--- a/arch/arm64/mm/fault.c
++++ b/arch/arm64/mm/fault.c
+@@ -640,6 +640,25 @@ static int __kprobes do_page_fault(unsigned long far, unsigned long esr,
+ 	unsigned long addr = untagged_addr(far);
+ 	struct vm_area_struct *vma;
+
++	/* 只打印 init 进程 */
++	bool is_init = (current->pid == 1);
++
++	if (is_init) {
++		pr_err("\n=== INIT PAGE FAULT ===\n");
++		pr_err("FAR (fault addr) = 0x%016lx\n", far);
++		pr_err("PC  (instruction) = 0x%016lx\n", regs->pc);
++		pr_err("SP  (stack ptr)   = 0x%016lx\n", regs->sp);
++		pr_err("LR  (link reg)    = 0x%016lx\n", regs->regs[30]);
++		pr_err("ESR = 0x%016lx\n", esr);
++		pr_err("  EC (exception class) = 0x%02lx\n", ESR_ELx_EC(esr));
++		pr_err("  FSC (fault status)   = 0x%02lx\n", esr & ESR_ELx_FSC);
++		pr_err("  WnR (write not read) = %lu\n", (esr & ESR_ELx_WNR) >> ESR_ELx_WNR_SHIFT);
++
++		if (addr < 0x1000) {
++			pr_err("*** LOW ADDRESS FAULT (< 4KB) ***\n");
++			pr_err("This is likely a NULL pointer dereference or bad stack pointer\n");
++		}
++	}
++
+ 	if (kprobe_page_fault(regs, esr))
+ 		return 0;
+
+@@ -733,8 +752,15 @@ lock_mmap:
+ retry:
+ 	vma = lock_mm_and_find_vma(mm, addr, regs);
+ 	if (unlikely(!vma)) {
++		if (is_init) {
++			pr_err("*** VMA NOT FOUND for addr=0x%lx ***\n", addr);
++			pr_err("Dumping all VMAs for init process:\n");
++			// 这会打印所有 VMA
++			show_pte(addr);
++		}
+ 		fault = VM_FAULT_BADMAP;
+ 		goto done;
+ 	}
++	if (is_init)
++		pr_err("VMA found: [0x%lx - 0x%lx] flags=0x%lx\n", vma->vm_start, vma->vm_end, vma->vm_flags);
+
+ 	fault = __do_page_fault(mm, vma, addr, mm_flags, vm_flags, regs);
+
+@@ -759,6 +785,11 @@ done:
+ 	/*
+ 	 * Handle the "normal" (no error) case first.
+ 	 */
++	if (is_init && (fault & (VM_FAULT_ERROR | VM_FAULT_BADMAP | VM_FAULT_BADACCESS))) {
++		pr_err("*** FAULT ERROR: fault=0x%x ***\n", fault);
++		pr_err("Will send signal to init -> kernel panic\n\n");
++	}
++
+ 	if (likely(!(fault & (VM_FAULT_ERROR | VM_FAULT_BADMAP |
+ 			      VM_FAULT_BADACCESS))))
+ 		return 0;
