@@ -1,0 +1,108 @@
+--- a/fs/binfmt_elf.c
++++ b/fs/binfmt_elf.c
+@@ -855,6 +855,11 @@ static int load_elf_binary(struct linux_binprm *bprm)
+ 	struct file *interpreter = NULL; /* to shut gcc up */
+ 	unsigned long load_bias = 0, phdr_addr = 0;
+ 	int first_pt_load = 1;
++
++	/* DEBUG: 只打印 init 进程 */
++	bool is_init = (current->pid == 1);
++	if (is_init)
++		pr_err("[ELF_INIT] load_elf_binary: starting to load %s\n", bprm->filename);
+ 	unsigned long error;
+ 	struct elf_phdr *elf_ppnt, *elf_phdata, *interp_elf_phdata = NULL;
+ 	struct elf_phdr *elf_property_phdata = NULL;
+@@ -1000,6 +1005,10 @@ static int load_elf_binary(struct linux_binprm *bprm)
+ 		}
+ 	}
+
++	if (is_init)
++		pr_err("[ELF_INIT] ELF header validated, e_entry=0x%lx, e_phnum=%d\n",
++			elf_ex->e_entry, elf_ex->e_phnum);
++
+ 	elf_ppnt = elf_phdata;
+ 	for (i = 0; i < elf_ex->e_phnum; i++, elf_ppnt++) {
+ 		char *elf_interpreter;
+@@ -1200,6 +1209,11 @@ static int load_elf_binary(struct linux_binprm *bprm)
+ 	if (retval < 0)
+ 		goto out_free_dentry;
+
++	if (is_init) {
++		pr_err("[ELF_INIT] flush_old_exec done, about to setup new mm\n");
++		pr_err("[ELF_INIT] current->mm = %p\n", current->mm);
++	}
++
+ 	/* Do this immediately, since STACK_TOP as used in setup_arg_pages
+ 	   may depend on the personality.  */
+ 	SET_PERSONALITY2(*elf_ex, &arch_state);
+@@ -1210,6 +1224,10 @@ static int load_elf_binary(struct linux_binprm *bprm)
+ 		goto out_free_dentry;
+ 	}
+
++	if (is_init)
++		pr_err("[ELF_INIT] setup_arg_pages done, stack vma created\n");
++
+ 	elf_bss = 0;
+ 	elf_brk = 0;
+
+@@ -1226,6 +1244,13 @@ static int load_elf_binary(struct linux_binprm *bprm)
+ 		int elf_prot, elf_flags;
+ 		unsigned long k, vaddr;
+ 		unsigned long total_size = 0;
++
++		if (is_init && elf_ppnt->p_type == PT_LOAD) {
++			pr_err("[ELF_INIT] Processing PT_LOAD segment #%d:\n", i);
++			pr_err("[ELF_INIT]   p_vaddr=0x%lx p_memsz=0x%lx p_flags=0x%x\n",
++				elf_ppnt->p_vaddr, elf_ppnt->p_memsz, elf_ppnt->p_flags);
++		}
+
+ 		if (elf_ppnt->p_type != PT_LOAD)
+ 			continue;
+@@ -1298,6 +1323,11 @@ static int load_elf_binary(struct linux_binprm *bprm)
+ 			total_size = 0;
+ 		}
+
++		if (is_init)
++			pr_err("[ELF_INIT] Calling elf_map: addr=0x%lx size=0x%lx prot=0x%x\n",
++				elf_ppnt->p_vaddr - elf_ppnt->p_offset,
++				elf_ppnt->p_filesz + elf_ppnt->p_offset, elf_prot);
++
+ 		error = elf_map(bprm->file, load_bias + vaddr, elf_ppnt,
+ 				elf_prot, elf_flags, total_size);
+ 		if (BAD_ADDR(error)) {
+@@ -1305,6 +1335,11 @@ static int load_elf_binary(struct linux_binprm *bprm)
+ 			goto out_free_dentry;
+ 		}
+
++		if (is_init)
++			pr_err("[ELF_INIT] elf_map returned: 0x%lx (load_bias=0x%lx)\n",
++				error, load_bias);
++
+ 		if (!load_addr_set) {
+ 			load_addr_set = 1;
+ 			load_addr = (elf_ppnt->p_vaddr - elf_ppnt->p_offset);
+@@ -1380,6 +1415,12 @@ static int load_elf_binary(struct linux_binprm *bprm)
+ 		}
+ 	}
+
++	if (is_init) {
++		pr_err("[ELF_INIT] All PT_LOAD segments processed\n");
++		pr_err("[ELF_INIT] Final: e_entry=0x%lx load_bias=0x%lx\n",
++			elf_ex->e_entry, load_bias);
++	}
++
+ 	e_entry = elf_ex->e_entry + load_bias;
+ 	phdr_addr += load_bias;
+ 	elf_bss += load_bias;
+@@ -1430,6 +1471,11 @@ static int load_elf_binary(struct linux_binprm *bprm)
+ 	}
+ #endif /* ARCH_HAS_SETUP_ADDITIONAL_PAGES */
+
++	if (is_init) {
++		pr_err("[ELF_INIT] About to start_thread, entry=0x%lx\n", e_entry);
++		pr_err("[ELF_INIT] Dumping current VMA list:\n");
++	}
++
+ 	retval = create_elf_tables(bprm, elf_ex, interp_load_addr,
+ 				   e_entry, phdr_addr);
+ 	if (retval < 0)
