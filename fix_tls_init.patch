@@ -1,0 +1,22 @@
+--- a/arch/arm64/include/asm/processor.h
++++ b/arch/arm64/include/asm/processor.h
+@@ -308,9 +308,18 @@ static inline void start_thread_common(struct pt_regs *regs, unsigned long pc)
+ static inline void start_thread(struct pt_regs *regs, unsigned long pc,
+ 				unsigned long sp)
+ {
++	/* DEBUG: 打印 init 进程的 TLS 初始化 */
++	if (current->pid == 1) {
++		pr_err("[INIT] start_thread: pc=0x%lx sp=0x%lx tp_value=0x%lx\n",
++			pc, sp, current->thread.uw.tp_value);
++	}
++
+ 	start_thread_common(regs, pc);
+ 	regs->pstate = PSR_MODE_EL0t;
+ 	spectre_v4_enable_task_mitigation(current);
+ 	regs->sp = sp;
++
++	/* 初始化 TLS 寄存器 - 这是修复 0x2b8 错误的关键 */
++	write_sysreg(*task_user_tls(current), tpidr_el0);
+ }
+
+ #ifdef CONFIG_AARCH32_EL0
