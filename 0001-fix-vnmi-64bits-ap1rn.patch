@@ -1,266 +1,124 @@
-From 173efaf008d3a4a3e844b1ff23fe3679bcbe3358 Mon Sep 17 00:00:00 2001
+From 57161579151df9a677372086c8fe17143553bc5b Mon Sep 17 00:00:00 2001
 From: Jin <1498902806@qq.com>
 Date: Mon, 31 Aug 2026 14:01:31 +0800
 Subject: [PATCH] fix vnmi 64bits ap1rn
 
 ---
- arch/arm64/include/asm/kvm_hyp.h   |  4 +--
- arch/arm64/kvm/hyp/nvhe/hyp-main.c |  6 ++--
- arch/arm64/kvm/hyp/vgic-v3-sr.c    | 53 +++++++++++++++++++-----------
- arch/arm64/kvm/vgic/vgic-v3.c      | 20 +++++++++--
- arch/arm64/kvm/vgic/vgic.h         |  1 +
- 5 files changed, 59 insertions(+), 25 deletions(-)
+ arch/arm64/include/asm/kvm_hyp.h |  1 +
+ arch/arm64/kvm/hyp/vgic-v3-sr.c  | 55 +++++++++++++++++++++++++++-----
+ 2 files changed, 48 insertions(+), 8 deletions(-)
 
 diff --git a/arch/arm64/include/asm/kvm_hyp.h b/arch/arm64/include/asm/kvm_hyp.h
-index 127ad280e68b..f4641f71b40e 100644
+index 127ad280e68b..c4121bf0aadc 100644
 --- a/arch/arm64/include/asm/kvm_hyp.h
 +++ b/arch/arm64/include/asm/kvm_hyp.h
-@@ -80,8 +80,8 @@ void __vgic_v3_save_state(struct vgic_v3_cpu_if *cpu_if);
- void __vgic_v3_restore_state(struct vgic_v3_cpu_if *cpu_if);
- void __vgic_v3_activate_traps(struct vgic_v3_cpu_if *cpu_if);
+@@ -82,6 +82,7 @@ void __vgic_v3_activate_traps(struct vgic_v3_cpu_if *cpu_if);
  void __vgic_v3_deactivate_traps(struct vgic_v3_cpu_if *cpu_if);
--void __vgic_v3_save_aprs(struct vgic_v3_cpu_if *cpu_if);
--void __vgic_v3_restore_aprs(struct vgic_v3_cpu_if *cpu_if);
-+void __vgic_v3_save_aprs(struct vgic_v3_cpu_if *cpu_if, bool vnmi);
-+void __vgic_v3_restore_aprs(struct vgic_v3_cpu_if *cpu_if, bool vnmi);
+ void __vgic_v3_save_aprs(struct vgic_v3_cpu_if *cpu_if);
+ void __vgic_v3_restore_aprs(struct vgic_v3_cpu_if *cpu_if);
++bool vgic_v3_vcpu_has_vnmi(struct kvm_vcpu *vcpu);
  int __vgic_v3_perform_cpuif_access(struct kvm_vcpu *vcpu);
  
  #ifdef __KVM_NVHE_HYPERVISOR__
-diff --git a/arch/arm64/kvm/hyp/nvhe/hyp-main.c b/arch/arm64/kvm/hyp/nvhe/hyp-main.c
-index f0e0986c0681..3db68be87acd 100644
---- a/arch/arm64/kvm/hyp/nvhe/hyp-main.c
-+++ b/arch/arm64/kvm/hyp/nvhe/hyp-main.c
-@@ -210,15 +210,17 @@ static void handle___kvm_get_mdcr_el2(struct kvm_cpu_context *host_ctxt)
- static void handle___vgic_v3_save_aprs(struct kvm_cpu_context *host_ctxt)
- {
- 	DECLARE_REG(struct vgic_v3_cpu_if *, cpu_if, host_ctxt, 1);
-+	DECLARE_REG(u64, vnmi, host_ctxt, 2);
- 
--	__vgic_v3_save_aprs(kern_hyp_va(cpu_if));
-+	__vgic_v3_save_aprs(kern_hyp_va(cpu_if), vnmi);
- }
- 
- static void handle___vgic_v3_restore_aprs(struct kvm_cpu_context *host_ctxt)
- {
- 	DECLARE_REG(struct vgic_v3_cpu_if *, cpu_if, host_ctxt, 1);
-+	DECLARE_REG(u64, vnmi, host_ctxt, 2);
- 
--	__vgic_v3_restore_aprs(kern_hyp_va(cpu_if));
-+	__vgic_v3_restore_aprs(kern_hyp_va(cpu_if), vnmi);
- }
- 
- static void handle___pkvm_init(struct kvm_cpu_context *host_ctxt)
 diff --git a/arch/arm64/kvm/hyp/vgic-v3-sr.c b/arch/arm64/kvm/hyp/vgic-v3-sr.c
-index 7a9e132f68db..fd3c3ef62648 100644
+index 7a9e132f68db..ab406332762e 100644
 --- a/arch/arm64/kvm/hyp/vgic-v3-sr.c
 +++ b/arch/arm64/kvm/hyp/vgic-v3-sr.c
-@@ -133,9 +133,21 @@ static void __vgic_v3_write_ap0rn(u32 val, int n)
- /*
-  * Contrary to ICH_AP0Rn_EL2, ICH_AP1R0_EL2 is 64bit, thanks to the
-  * NMI bit stuck at [63]. Isn't that fun?
-+ *
-+ * This 64bit-ness is only valid when the vcpu has vNMI enabled
-+ * (vnmi).  Otherwise the register is only 32bit wide: drop the
-+ * upper bits on read, and zero them on write, as they are RES0
-+ * without FEAT_GIC_NMI.
-+ *
-+ * The callers implementing the CPU interface trap emulation always
-+ * pass vnmi=false, as the CPU interface is only trapped when vNMI
-+ * is not available.
-  */
--static void __vgic_v3_write_ap1rn(u64 val, int n)
-+static void __vgic_v3_write_ap1rn(u64 val, int n, bool vnmi)
- {
-+	if (!vnmi)
-+		val = (u32)val;
-+
- 	switch (n) {
- 	case 0:
- 		write_gicreg(val, ICH_AP1R0_EL2);
-@@ -177,7 +189,7 @@ static u32 __vgic_v3_read_ap0rn(int n)
- }
- 
- /* Same remark about the 64bit-ness of AP1R0 */
--static u64 __vgic_v3_read_ap1rn(int n)
-+static u64 __vgic_v3_read_ap1rn(int n, bool vnmi)
- {
- 	u64 val;
- 
-@@ -198,6 +210,9 @@ static u64 __vgic_v3_read_ap1rn(int n)
- 		unreachable();
- 	}
- 
-+	if (!vnmi)
-+		val = (u32)val;
-+
- 	return val;
- }
- 
-@@ -335,7 +350,7 @@ void __vgic_v3_deactivate_traps(struct vgic_v3_cpu_if *cpu_if)
+@@ -335,10 +335,40 @@ void __vgic_v3_deactivate_traps(struct vgic_v3_cpu_if *cpu_if)
  		write_gicreg(0, ICH_HCR_EL2);
  }
  
--void __vgic_v3_save_aprs(struct vgic_v3_cpu_if *cpu_if)
-+void __vgic_v3_save_aprs(struct vgic_v3_cpu_if *cpu_if, bool vnmi)
++static struct kvm_vcpu *vgic_v3_cpu_if_to_vcpu(struct vgic_v3_cpu_if *cpu_if)
++{
++	struct vgic_cpu *vgic_cpu = container_of(cpu_if, struct vgic_cpu, vgic_v3);
++
++	return container_of(vgic_cpu, struct kvm_vcpu, arch.vgic_cpu);
++}
++
++/*
++ * vNMI is only usable if the guest has selected NMI support
++ * (vgic.has_nmi) and the vcpu has FEAT_NMI (pfr1_nmi).
++ *
++ * This drives the width of the ICH_AP1Rn_EL2 accesses: with vNMI the
++ * registers are 64bit (the NMI priority lives in ICH_AP1R0_EL2[63]),
++ * without it only the low 32 bits are valid.
++ */
++bool vgic_v3_vcpu_has_vnmi(struct kvm_vcpu *vcpu)
++{
++	struct kvm *kvm = kern_hyp_va(vcpu->kvm);
++
++	return kvm->arch.vgic.has_nmi &&
++	       kvm->arch.pfr1_nmi == ID_AA64PFR1_EL1_NMI_IMP;
++}
++
+ void __vgic_v3_save_aprs(struct vgic_v3_cpu_if *cpu_if)
  {
  	u64 val;
  	u32 nr_pre_bits;
-@@ -357,18 +372,18 @@ void __vgic_v3_save_aprs(struct vgic_v3_cpu_if *cpu_if)
++	/*
++	 * ICH_AP1Rn_EL2 are only 64bit when the vcpu has vNMI: the NMI
++	 * priority is encoded in ICH_AP1R0_EL2[63].  Without vNMI, the
++	 * upper bits are RES0 and only the low 32 bits must be
++	 * preserved.
++	 */
++	bool vnmi = vgic_v3_vcpu_has_vnmi(vgic_v3_cpu_if_to_vcpu(cpu_if));
+ 
+ 	val = read_gicreg(ICH_VTR_EL2);
+ 	nr_pre_bits = vtr_to_nr_pre_bits(val);
+@@ -357,14 +387,18 @@ void __vgic_v3_save_aprs(struct vgic_v3_cpu_if *cpu_if)
  
  	switch (nr_pre_bits) {
  	case 7:
 -		cpu_if->vgic_ap1r[3] = __vgic_v3_read_ap1rn(3);
 -		cpu_if->vgic_ap1r[2] = __vgic_v3_read_ap1rn(2);
-+		cpu_if->vgic_ap1r[3] = __vgic_v3_read_ap1rn(3, vnmi);
-+		cpu_if->vgic_ap1r[2] = __vgic_v3_read_ap1rn(2, vnmi);
++		cpu_if->vgic_ap1r[3] = vnmi ? __vgic_v3_read_ap1rn(3)
++					    : (u32)__vgic_v3_read_ap1rn(3);
++		cpu_if->vgic_ap1r[2] = vnmi ? __vgic_v3_read_ap1rn(2)
++					    : (u32)__vgic_v3_read_ap1rn(2);
  		fallthrough;
  	case 6:
 -		cpu_if->vgic_ap1r[1] = __vgic_v3_read_ap1rn(1);
-+		cpu_if->vgic_ap1r[1] = __vgic_v3_read_ap1rn(1, vnmi);
++		cpu_if->vgic_ap1r[1] = vnmi ? __vgic_v3_read_ap1rn(1)
++					    : (u32)__vgic_v3_read_ap1rn(1);
  		fallthrough;
  	default:
 -		cpu_if->vgic_ap1r[0] = __vgic_v3_read_ap1rn(0);
-+		cpu_if->vgic_ap1r[0] = __vgic_v3_read_ap1rn(0, vnmi);
++		cpu_if->vgic_ap1r[0] = vnmi ? __vgic_v3_read_ap1rn(0)
++					    : (u32)__vgic_v3_read_ap1rn(0);
  	}
  }
  
--void __vgic_v3_restore_aprs(struct vgic_v3_cpu_if *cpu_if)
-+void __vgic_v3_restore_aprs(struct vgic_v3_cpu_if *cpu_if, bool vnmi)
+@@ -372,6 +406,7 @@ void __vgic_v3_restore_aprs(struct vgic_v3_cpu_if *cpu_if)
  {
  	u64 val;
  	u32 nr_pre_bits;
-@@ -390,14 +405,14 @@ void __vgic_v3_restore_aprs(struct vgic_v3_cpu_if *cpu_if)
++	bool vnmi = vgic_v3_vcpu_has_vnmi(vgic_v3_cpu_if_to_vcpu(cpu_if));
+ 
+ 	val = read_gicreg(ICH_VTR_EL2);
+ 	nr_pre_bits = vtr_to_nr_pre_bits(val);
+@@ -390,14 +425,18 @@ void __vgic_v3_restore_aprs(struct vgic_v3_cpu_if *cpu_if)
  
  	switch (nr_pre_bits) {
  	case 7:
 -		__vgic_v3_write_ap1rn(cpu_if->vgic_ap1r[3], 3);
 -		__vgic_v3_write_ap1rn(cpu_if->vgic_ap1r[2], 2);
-+		__vgic_v3_write_ap1rn(cpu_if->vgic_ap1r[3], 3, vnmi);
-+		__vgic_v3_write_ap1rn(cpu_if->vgic_ap1r[2], 2, vnmi);
++		__vgic_v3_write_ap1rn(vnmi ? cpu_if->vgic_ap1r[3]
++					   : (u32)cpu_if->vgic_ap1r[3], 3);
++		__vgic_v3_write_ap1rn(vnmi ? cpu_if->vgic_ap1r[2]
++					   : (u32)cpu_if->vgic_ap1r[2], 2);
  		fallthrough;
  	case 6:
 -		__vgic_v3_write_ap1rn(cpu_if->vgic_ap1r[1], 1);
-+		__vgic_v3_write_ap1rn(cpu_if->vgic_ap1r[1], 1, vnmi);
++		__vgic_v3_write_ap1rn(vnmi ? cpu_if->vgic_ap1r[1]
++					   : (u32)cpu_if->vgic_ap1r[1], 1);
  		fallthrough;
  	default:
 -		__vgic_v3_write_ap1rn(cpu_if->vgic_ap1r[0], 0);
-+		__vgic_v3_write_ap1rn(cpu_if->vgic_ap1r[0], 0, vnmi);
++		__vgic_v3_write_ap1rn(vnmi ? cpu_if->vgic_ap1r[0]
++					   : (u32)cpu_if->vgic_ap1r[0], 0);
  	}
  }
  
-@@ -565,7 +580,7 @@ static int __vgic_v3_get_highest_active_priority(void)
- 		 * BPR, but without the full subpriority.
- 		 */
- 		val  = __vgic_v3_read_ap0rn(i);
--		val |= __vgic_v3_read_ap1rn(i);
-+		val |= __vgic_v3_read_ap1rn(i, false);
- 		if (!val) {
- 			hap += 32;
- 			continue;
-@@ -633,8 +648,8 @@ static void __vgic_v3_set_active_priority(u8 pri, u32 vmcr, int grp)
- 		val = __vgic_v3_read_ap0rn(apr);
- 		__vgic_v3_write_ap0rn(val | BIT(ap % 32), apr);
- 	} else {
--		val = __vgic_v3_read_ap1rn(apr);
--		__vgic_v3_write_ap1rn(val | BIT(ap % 32), apr);
-+		val = __vgic_v3_read_ap1rn(apr, false);
-+		__vgic_v3_write_ap1rn(val | BIT(ap % 32), apr, false);
- 	}
- }
- 
-@@ -649,7 +664,7 @@ static int __vgic_v3_clear_highest_active_priority(void)
- 		int c0, c1;
- 
- 		ap0 = __vgic_v3_read_ap0rn(i);
--		ap1 = __vgic_v3_read_ap1rn(i);
-+		ap1 = __vgic_v3_read_ap1rn(i, false);
- 		if (!ap0 && !ap1) {
- 			hap += 32;
- 			continue;
-@@ -665,7 +680,7 @@ static int __vgic_v3_clear_highest_active_priority(void)
- 			hap += c0;
- 		} else {
- 			ap1 &= ~BIT(c1);
--			__vgic_v3_write_ap1rn(ap1, i);
-+			__vgic_v3_write_ap1rn(ap1, i, false);
- 			hap += c1;
- 		}
- 
-@@ -878,7 +893,7 @@ static void __vgic_v3_read_apxrn(struct kvm_vcpu *vcpu, int rt, int n)
- 	if (!__vgic_v3_get_group(vcpu))
- 		val = __vgic_v3_read_ap0rn(n);
- 	else
--		val = __vgic_v3_read_ap1rn(n);
-+		val = __vgic_v3_read_ap1rn(n, false);
- 
- 	vcpu_set_reg(vcpu, rt, val);
- }
-@@ -890,7 +905,7 @@ static void __vgic_v3_write_apxrn(struct kvm_vcpu *vcpu, int rt, int n)
- 	if (!__vgic_v3_get_group(vcpu))
- 		__vgic_v3_write_ap0rn(val, n);
- 	else
--		__vgic_v3_write_ap1rn(val, n);
-+		__vgic_v3_write_ap1rn(val, n, false);
- }
- 
- static void __vgic_v3_read_apxr0(struct kvm_vcpu *vcpu,
-diff --git a/arch/arm64/kvm/vgic/vgic-v3.c b/arch/arm64/kvm/vgic/vgic-v3.c
-index 8600b443df42..c91b46cb9e4c 100644
---- a/arch/arm64/kvm/vgic/vgic-v3.c
-+++ b/arch/arm64/kvm/vgic/vgic-v3.c
-@@ -740,6 +740,20 @@ int vgic_v3_probe(const struct gic_kvm_info *info)
- 	return 0;
- }
- 
-+/*
-+ * vNMI is only usable if the guest has selected NMI support
-+ * (vgic.has_nmi) and the vcpu has FEAT_NMI (pfr1_nmi).
-+ *
-+ * vgic-v3-sr.c uses this to decide whether ICH_AP1Rn_EL2 must be
-+ * accessed as 64bit: with vNMI the NMI priority is encoded in
-+ * ICH_AP1R0_EL2[63], without it only the low 32 bits are valid.
-+ */
-+bool vgic_v3_vcpu_has_vnmi(struct kvm_vcpu *vcpu)
-+{
-+	return vcpu->kvm->arch.vgic.has_nmi &&
-+	       vcpu->kvm->arch.pfr1_nmi == ID_AA64PFR1_EL1_NMI_IMP;
-+}
-+
- void vgic_v3_load(struct kvm_vcpu *vcpu)
- {
- 	struct vgic_v3_cpu_if *cpu_if = &vcpu->arch.vgic_cpu.vgic_v3;
-@@ -752,7 +766,8 @@ void vgic_v3_load(struct kvm_vcpu *vcpu)
- 	if (likely(cpu_if->vgic_sre))
- 		kvm_call_hyp(__vgic_v3_write_vmcr, cpu_if->vgic_vmcr);
- 
--	kvm_call_hyp(__vgic_v3_restore_aprs, cpu_if);
-+	kvm_call_hyp(__vgic_v3_restore_aprs, cpu_if,
-+		     vgic_v3_vcpu_has_vnmi(vcpu));
- 
- 	if (has_vhe())
- 		__vgic_v3_activate_traps(cpu_if);
-@@ -790,7 +805,8 @@ void vgic_v3_put(struct kvm_vcpu *vcpu)
- 
- 	vgic_v3_vmcr_sync(vcpu);
- 
--	kvm_call_hyp(__vgic_v3_save_aprs, cpu_if);
-+	kvm_call_hyp(__vgic_v3_save_aprs, cpu_if,
-+		     vgic_v3_vcpu_has_vnmi(vcpu));
- 
- 	if (has_vhe())
- 		__vgic_v3_deactivate_traps(cpu_if);
-diff --git a/arch/arm64/kvm/vgic/vgic.h b/arch/arm64/kvm/vgic/vgic.h
-index f78c026c20f0..09c4ebd2ecaa 100644
---- a/arch/arm64/kvm/vgic/vgic.h
-+++ b/arch/arm64/kvm/vgic/vgic.h
-@@ -246,6 +246,7 @@ void vgic_v3_clear_lr(struct kvm_vcpu *vcpu, int lr);
- void vgic_v3_set_underflow(struct kvm_vcpu *vcpu);
- void vgic_v3_set_vmcr(struct kvm_vcpu *vcpu, struct vgic_vmcr *vmcr);
- void vgic_v3_get_vmcr(struct kvm_vcpu *vcpu, struct vgic_vmcr *vmcr);
-+bool vgic_v3_vcpu_has_vnmi(struct kvm_vcpu *vcpu);
- void vgic_v3_enable(struct kvm_vcpu *vcpu);
- int vgic_v3_probe(const struct gic_kvm_info *info);
- int vgic_v3_map_resources(struct kvm *kvm);
 -- 
 2.43.0
 

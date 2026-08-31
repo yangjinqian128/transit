@@ -1,0 +1,225 @@
+From 45b89d6001864af9f714d4bbcb20cf9b3eedd4e9 Mon Sep 17 00:00:00 2001
+From: Jin <1498902806@qq.com>
+Date: Fri, 3 Jul 2026 14:52:04 +0800
+Subject: [PATCH] add debug-reboot
+
+---
+ debug-reboot-deadloop.patch | 206 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 206 insertions(+)
+ create mode 100644 debug-reboot-deadloop.patch
+
+diff --git a/debug-reboot-deadloop.patch b/debug-reboot-deadloop.patch
+new file mode 100644
+index 0000000..feceb06
+--- /dev/null
++++ b/debug-reboot-deadloop.patch
+@@ -0,0 +1,206 @@
++diff --git a/drivers/net/virtio_net.c b/drivers/net/virtio_net.c
++index caae11ba2f8b..a49f0246bdfa 100644
++--- a/drivers/net/virtio_net.c
+++++ b/drivers/net/virtio_net.c
++@@ -790,8 +790,12 @@ static void free_old_xmit_skbs(struct send_queue *sq, bool in_napi)
++ 	/* Avoid overhead when no packets have been processed
++ 	 * happens when called speculatively from start_xmit.
++ 	 */
++-	if (!packets)
+++	if (!packets) {
+++		if (unlikely(virtqueue_is_broken(sq->vq) || sq->vq->num_free == 0))
+++			pr_warn_ratelimited("free_old_xmit_skbs: no progress vq=%px broken=%d num_free=%u\n",
+++				sq->vq, virtqueue_is_broken(sq->vq), sq->vq->num_free);
++ 		return;
+++	}
++ 
++ 	u64_stats_update_begin(&sq->stats.syncp);
++ 	u64_stats_add(&sq->stats.bytes, bytes);
++@@ -2413,14 +2417,32 @@ static netdev_tx_t start_xmit(struct sk_buff *skb, struct net_device *dev)
++ 	bool use_napi = sq->napi.weight;
++ 
++ 	/* Free up any pending old buffers before queueing new ones. */
++-	do {
++-		if (use_napi)
++-			virtqueue_disable_cb(sq->vq);
+++	{
+++		int _loop_cnt = 0;
++ 
++-		free_old_xmit_skbs(sq, false);
+++		do {
+++			if (use_napi)
+++				virtqueue_disable_cb(sq->vq);
++ 
++-	} while (use_napi && kick &&
++-	       unlikely(!virtqueue_enable_cb_delayed(sq->vq)));
+++			free_old_xmit_skbs(sq, false);
+++
+++			if (!(use_napi && kick))
+++				break;
+++			if (likely(virtqueue_enable_cb_delayed(sq->vq)))
+++				break;
+++			if (++_loop_cnt >= 100000) {
+++				pr_warn("start_xmit: LOOP STUCK vq=%px qnum=%d num_free=%u broken=%d loop=%d\n",
+++					sq->vq, qnum, sq->vq->num_free,
+++					virtqueue_is_broken(sq->vq), _loop_cnt);
+++				if (_loop_cnt >= 1000000) {
+++					pr_err("start_xmit: BREAK OUT after 1M loops, WARN\n");
+++					WARN_ON(1);
+++					break;
+++				}
+++			}
+++			cond_resched();
+++		} while (1);
+++	}
++ 
++ 	/* timestamp packet in software */
++ 	skb_tx_timestamp(skb);
++@@ -2710,6 +2732,8 @@ static int virtnet_close(struct net_device *dev)
++ 	struct virtnet_info *vi = netdev_priv(dev);
++ 	int i;
++ 
+++	pr_warn("virtnet_close: ENTER dev=%px vi=%px\n", dev, vi);
+++
++ 	/* Make sure NAPI doesn't schedule refill work */
++ 	disable_delayed_refill(vi);
++ 	/* Make sure refill_work doesn't re-enable napi! */
++@@ -2718,6 +2742,7 @@ static int virtnet_close(struct net_device *dev)
++ 	for (i = 0; i < vi->max_queue_pairs; i++)
++ 		virtnet_disable_queue_pair(vi, i);
++ 
+++	pr_warn("virtnet_close: EXIT\n");
++ 	return 0;
++ }
++ 
++@@ -3735,14 +3760,19 @@ static void virtnet_freeze_down(struct virtio_device *vdev)
++ {
++ 	struct virtnet_info *vi = vdev->priv;
++ 
+++	pr_warn("virtnet_freeze_down: ENTER vi=%px dev=%px\n", vi, vi->dev);
+++
++ 	/* Make sure no work handler is accessing the device */
++ 	flush_work(&vi->config_work);
++ 
++ 	netif_tx_lock_bh(vi->dev);
++ 	netif_device_detach(vi->dev);
++ 	netif_tx_unlock_bh(vi->dev);
++-	if (netif_running(vi->dev))
+++	if (netif_running(vi->dev)) {
+++		pr_warn("virtnet_freeze_down: calling virtnet_close\n");
++ 		virtnet_close(vi->dev);
+++	}
+++	pr_warn("virtnet_freeze_down: EXIT\n");
++ }
++ 
++ static int init_vqs(struct virtnet_info *vi);
++@@ -4755,8 +4785,11 @@ static int virtnet_probe(struct virtio_device *vdev)
++ 
++ static void remove_vq_common(struct virtnet_info *vi)
++ {
+++	pr_warn("remove_vq_common: ENTER vi=%px dev=%px running=%d\n",
+++		vi, vi->dev, netif_running(vi->dev));
++ 	virtio_reset_device(vi->vdev);
++ 
+++	pr_warn("remove_vq_common: after reset, freeing unused bufs\n");
++ 	/* Free unused buffers in both send and recv, if any. */
++ 	free_unused_bufs(vi);
++ 
++@@ -4765,34 +4798,43 @@ static void remove_vq_common(struct virtnet_info *vi)
++ 	free_receive_page_frags(vi);
++ 
++ 	virtnet_del_vqs(vi);
+++	pr_warn("remove_vq_common: EXIT vi=%px\n", vi);
++ }
++ 
++ static void virtnet_remove(struct virtio_device *vdev)
++ {
++ 	struct virtnet_info *vi = vdev->priv;
++ 
+++	pr_warn("virtnet_remove: ENTER vi=%px dev=%px\n", vi, vi->dev);
+++
++ 	virtnet_cpu_notif_remove(vi);
++ 
++ 	/* Make sure no work handler is accessing the device. */
++ 	flush_work(&vi->config_work);
++ 
+++	pr_warn("virtnet_remove: calling unregister_netdev\n");
++ 	unregister_netdev(vi->dev);
++ 
++ 	net_failover_destroy(vi->failover);
++ 
+++	pr_warn("virtnet_remove: calling remove_vq_common\n");
++ 	remove_vq_common(vi);
++ 
++ 	free_netdev(vi->dev);
+++	pr_warn("virtnet_remove: DONE\n");
++ }
++ 
++ static __maybe_unused int virtnet_freeze(struct virtio_device *vdev)
++ {
++ 	struct virtnet_info *vi = vdev->priv;
++ 
+++	pr_warn("virtnet_freeze: ENTER vi=%px dev=%px\n", vi, vi->dev);
+++
++ 	virtnet_cpu_notif_remove(vi);
++ 	virtnet_freeze_down(vdev);
++ 	remove_vq_common(vi);
++ 
+++	pr_warn("virtnet_freeze: DONE\n");
++ 	return 0;
++ }
++ 
++diff --git a/drivers/virtio/virtio.c b/drivers/virtio/virtio.c
++index 9518583d1512..4036380c1c99 100644
++--- a/drivers/virtio/virtio.c
+++++ b/drivers/virtio/virtio.c
++@@ -219,6 +219,7 @@ static int virtio_features_ok(struct virtio_device *dev)
++  * */
++ void virtio_reset_device(struct virtio_device *dev)
++ {
+++	pr_warn("virtio_reset_device: START dev=%px\n", dev);
++ #ifdef CONFIG_VIRTIO_HARDEN_NOTIFICATION
++ 	/*
++ 	 * The below virtio_synchronize_cbs() guarantees that any
++@@ -226,11 +227,15 @@ void virtio_reset_device(struct virtio_device *dev)
++ 	 * virtio_synchronize_vqs() has completed is guaranteed to see
++ 	 * vq->broken as true.
++ 	 */
+++	pr_warn("virtio_reset_device: breaking device and syncing cbs\n");
++ 	virtio_break_device(dev);
++ 	virtio_synchronize_cbs(dev);
+++#else
+++	pr_warn("virtio_reset_device: CONFIG_VIRTIO_HARDEN_NOTIFICATION not set, skipping break+sync\n");
++ #endif
++ 
++ 	dev->config->reset(dev);
+++	pr_warn("virtio_reset_device: DONE dev=%px\n", dev);
++ }
++ EXPORT_SYMBOL_GPL(virtio_reset_device);
++ 
++diff --git a/drivers/virtio/virtio_ring.c b/drivers/virtio/virtio_ring.c
++index ef2bf170f574..82e9d41d7d0e 100644
++--- a/drivers/virtio/virtio_ring.c
+++++ b/drivers/virtio/virtio_ring.c
++@@ -952,6 +952,7 @@ static bool virtqueue_enable_cb_delayed_split(struct virtqueue *_vq)
++ {
++ 	struct vring_virtqueue *vq = to_vvq(_vq);
++ 	u16 bufs;
+++	u16 used_idx;
++ 
++ 	START_USE(vq);
++ 
++@@ -974,8 +975,12 @@ static bool virtqueue_enable_cb_delayed_split(struct virtqueue *_vq)
++ 			&vring_used_event(&vq->split.vring),
++ 			cpu_to_virtio16(_vq->vdev, vq->last_used_idx + bufs));
++ 
++-	if (unlikely((u16)(virtio16_to_cpu(_vq->vdev, vq->split.vring.used->idx)
++-					- vq->last_used_idx) > bufs)) {
+++	used_idx = virtio16_to_cpu(_vq->vdev, vq->split.vring.used->idx);
+++	if (unlikely((u16)(used_idx - vq->last_used_idx) > bufs)) {
+++		if (vq->broken)
+++			pr_warn_ratelimited("virtqueue_enable_cb_delayed_split: BROKEN vq=%px used_idx=%u last_used=%u avail_shadow=%u bufs=%u\n",
+++				_vq, used_idx, vq->last_used_idx,
+++				vq->split.avail_idx_shadow, bufs);
++ 		END_USE(vq);
++ 		return false;
++ 	}
+-- 
+2.43.0
+
