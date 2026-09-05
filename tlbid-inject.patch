@@ -1,14 +1,14 @@
 diff --git a/drivers/misc/tlbid_inject.c b/drivers/misc/tlbid_inject.c
 new file mode 100644
-index 0000000000000..b13c821e36517
+index 0000000000000..337db197d00c7
 --- /dev/null
 +++ b/drivers/misc/tlbid_inject.c
-@@ -0,0 +1,165 @@
+@@ -0,0 +1,113 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * tlbid_inject.c - FEAT_TLBID (TLBI Domains) instruction injection test
 + *
-+ * Executes a single TLBI instruction carrying a TLBID domain operand at
++ * Executes a single "tlbi aside1is" carrying a TLBID domain operand at
 + * insmod time, for verifying hardware behaviour of FEAT_TLBID (Armv9.7-A
 + * "TLBI Domains"):
 + *
@@ -20,6 +20,11 @@ index 0000000000000..b13c821e36517
 + *                                       'rmmod -f tlbid_inject', then re-run
 + *                                       with different parameters.
 + *
++ * This is exactly the instruction form used by the OpenEuler OLK-6.6 TLBID
++ * optimization for flush_tlb_mm() (its __TLBI_DOMAIN macro packs
++ * (ASID << 48) | domain[15:0] into the aside1is operand), so this module
++ * reproduces the production TLBID path 1:1.
++ *
 + * This covers the CONSTRAINED UNPREDICTABLE cases of the architecture: an
 + * implementation without FEAT_TLBID must either UNDEFINED the instruction
 + * or silently behave as if the TLBID field were all-ones. The oops (or
@@ -29,30 +34,18 @@ index 0000000000000..b13c821e36517
 + *
 + * Usage (the instruction runs on the CPU executing insmod; pin with
 + * taskset for per-CPU experiments):
-+ *   taskset -c <cpu> insmod tlbid_inject.ko op=aside1is asid=1 domain=5
++ *   taskset -c <cpu> insmod tlbid_inject.ko domain=5
 + *
-+ *   op: aside1is | aside1os | aside1 | vmalle1is | vmalle1os | vmalle1
-+ *   asid:    ASID value, packed into operand bits [63:48] (aside1 ops).
-+ *            Omitted: automatically uses the insmod process's own ASID
++ *   asid:    ASID value, packed into operand bits [63:48]. Omitted:
++ *            automatically uses the insmod process's own ASID
 + *            (ASID(current->mm)) - the injection then only ever touches
 + *            the caller's own TLB entries, zero impact on other processes
 + *            and the kernel. Explicit value overrides this (e.g. asid=0
 + *            to exercise the kernel's ASID-0 entries).
 + *   domain:  16-bit TLBID domain, packed into operand bits [15:0]
 + *
-+ * Encoding reference: OpenEuler OLK-6.6 series "[PATCH 0/6] arm64:
-+ * tlbflush: Optimize flush_tlb_mm() by using TLBID" (its __TLBI_DOMAIN
-+ * macro packs (ASID << 48) | domain[15:0] into the aside1is operand).
-+ *
-+ * The vmalle1 ops are emitted via .inst constants (base encoding
-+ * 0xd5000000 | sys_insn(1, 0, 8, <CRm>, 0) | Rt, with the domain loaded
-+ * into a fixed register) so that no modern-binutils assumption is needed:
-+ * gas only accepts an explicit xzr operand for these ops before the
-+ * FEAT_TLBID binutils changes, while the kernel's own macro expansion
-+ * requires none at all.
-+ *
-+ * Note: an IS/OS variant really invalidates TLBs - scoped by the domain
-+ * on FEAT_TLBID hardware, full broadcast otherwise. Run on a test machine.
++ * Note: the IS variant really invalidates TLBs - scoped by the domain on
++ * FEAT_TLBID hardware, full broadcast otherwise. Run on a test machine.
 + *
 + * Build (out-of-tree):
 + *   echo 'obj-m := tlbid_inject.o' > Makefile
@@ -69,10 +62,6 @@ index 0000000000000..b13c821e36517
 +#include <asm/mmu.h>
 +#include <asm/sysreg.h>
 +
-+static char *op = "aside1is";
-+module_param(op, charp, 0444);
-+MODULE_PARM_DESC(op, "aside1is | aside1os | aside1 | vmalle1is | vmalle1os | vmalle1");
-+
 +static u64 asid = (u64)-1;
 +module_param(asid, ullong, 0444);
 +MODULE_PARM_DESC(asid, "ASID value, operand bits [63:48]; omitted: use the insmod process's own ASID (zero impact on others)");
@@ -81,49 +70,12 @@ index 0000000000000..b13c821e36517
 +module_param(domain, ullong, 0444);
 +MODULE_PARM_DESC(domain, "16-bit TLBID domain, operand bits [15:0]");
 +
-+/*
-+ * Full encoding of "tlbi vmalle1<X>, x20":
-+ * 0xd5000000 | sys_insn(op0=1, op1=0, CRn=8, CRm, op2=0) | Rt=20
-+ * CRm: OS=1, IS=3, NS=7 (asm/sysreg.h OP_TLBI_VMALLE1{OS,IS})
-+ */
-+#define TLBI_INST(crm, rt)	(0xd5000000UL | sys_insn(1, 0, 8, (crm), 0) | (rt))
-+
-+static int do_inject(const char *op, u64 operand, u64 domain)
-+{
-+	if (!strcmp(op, "aside1is")) {
-+		asm volatile("tlbi aside1is, %0" :: "r"(operand));
-+	} else if (!strcmp(op, "aside1os")) {
-+		asm volatile("tlbi aside1os, %0" :: "r"(operand));
-+	} else if (!strcmp(op, "aside1")) {
-+		asm volatile("tlbi aside1, %0" :: "r"(operand));
-+	} else if (!strcmp(op, "vmalle1is")) {
-+		asm volatile("mov x20, %0\n\t"
-+			     ".inst %1\n"
-+			     :: "r"(domain), "i"(TLBI_INST(3, 20)) : "x20");
-+	} else if (!strcmp(op, "vmalle1os")) {
-+		asm volatile("mov x20, %0\n\t"
-+			     ".inst %1\n"
-+			     :: "r"(domain), "i"(TLBI_INST(1, 20)) : "x20");
-+	} else if (!strcmp(op, "vmalle1")) {
-+		asm volatile("mov x20, %0\n\t"
-+			     ".inst %1\n"
-+			     :: "r"(domain), "i"(TLBI_INST(7, 20)) : "x20");
-+	} else {
-+		pr_err("unknown op '%s' (aside1is|aside1os|aside1|vmalle1is|vmalle1os|vmalle1)\n",
-+		       op);
-+		return -EINVAL;
-+	}
-+
-+	return 0;
-+}
-+
 +static int __init tlbid_inject_init(void)
 +{
 +	bool own_asid = (asid == (u64)-1);
 +	u64 operand;
 +	u8 el;
 +	int cpu;
-+	int ret;
 +
 +	/*
 +	 * Pin to the current CPU for the whole injection so the reported
@@ -142,25 +94,21 @@ index 0000000000000..b13c821e36517
 +	if (own_asid)
 +		asid = ASID(current->mm);
 +
++	/* OpenEuler __TLBI_DOMAIN encoding: (ASID << 48) | domain[15:0] */
 +	operand = ((asid << 48) & GENMASK_ULL(63, 48)) |
 +		  (domain & GENMASK_ULL(15, 0));
 +
-+	pr_info("inject op=%s asid=%#llx%s domain=%#llx (cpu=%d el=%u)\n",
-+		op, asid, own_asid ? " (own)" : "", domain, cpu, el);
++	pr_info("inject asid=%#llx%s domain=%#llx (cpu=%d el=%u)\n",
++		asid, own_asid ? " (own)" : "", domain, cpu, el);
 +
 +	dsb(ishst);
-+	ret = do_inject(op, operand, domain & GENMASK_ULL(15, 0));
++	asm volatile("tlbi aside1is, %0" :: "r"(operand));
 +	dsb(ish);
 +	isb();
 +
-+	if (ret) {
-+		preempt_enable();
-+		return ret;
-+	}
-+
 +	/* Reached only if the hardware executed the instruction. */
-+	pr_info("OK: op=%s executed, no exception (cpu=%d el=%u)\n",
-+		op, cpu, el);
++	pr_info("OK: aside1is executed, no exception (cpu=%d el=%u)\n",
++		cpu, el);
 +
 +	preempt_enable();
 +	return 0;
