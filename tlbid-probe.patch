@@ -1,9 +1,9 @@
 diff --git a/drivers/misc/tlbid_probe.c b/drivers/misc/tlbid_probe.c
 new file mode 100644
-index 0000000000000..ffba5a4ed958b
+index 0000000000000..b891aab5c7592
 --- /dev/null
 +++ b/drivers/misc/tlbid_probe.c
-@@ -0,0 +1,445 @@
+@@ -0,0 +1,442 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * tlbid_probe.c - FEAT_TLBID domain -> PE mapping probe
@@ -26,6 +26,11 @@ index 0000000000000..ffba5a4ed958b
 + * Depends on the OpenEuler OLK-6.6 TLBID patch series providing
 + * system_supports_tlbid() and SYS_TLBIDIDR_EL1 (absent in mainline v7.3 -
 + * build against a tree that has them).
++ *
++ * Module-linking compatibility with OLK-6.6/v7.3: mm_alloc and the
++ * __pud_alloc/__pmd_alloc/__pte_offset_map_lock helpers are NOT exported
++ * to modules, so the probe reuses the insmod process's own mm and walks
++ * the page tables with the *_offset()/pte_offset_map() inlines only.
 + *
 + * Ambient-flush defence: before each injection the sentinels are verified
 + * to be in place; a lost sentinel before injection means the environment
@@ -80,7 +85,7 @@ index 0000000000000..ffba5a4ed958b
 +};
 +
 +static struct {
-+	struct mm_struct *mm;		/* shared guard mm: one ASID for all PEs */
++	struct mm_struct *mm;		/* insmod's own mm: one ASID for all PEs */
 +	unsigned long	addr;		/* probe page, user mapping of guard mm */
 +	pte_t		*ptep;		/* its PTE (TLB-only surgery) */
 +	spinlock_t	*ptl;
@@ -116,8 +121,11 @@ index 0000000000000..ffba5a4ed958b
 +}
 +
 +/*
-+ * pes[0] runs this before signalling ready: it maps the probe page into
-+ * the guard mm, faults it in (creating the PTE) and locates the PTE.
++ * Runs in module_init on the insmod process: maps the probe page into
++ * insmod's own mm, faults it in (creating the PTE) and locates the PTE.
++ * Hand-walk with *_offset()/pte_offset_map() only - the table already
++ * exists after the fault-in, and the alloc variants are not exported to
++ * modules.
 + */
 +static int guard_setup(void)
 +{
@@ -142,24 +150,20 @@ index 0000000000000..ffba5a4ed958b
 +	mmap_read_lock(st.mm);
 +	pgd = pgd_offset(st.mm, addr);
 +	p4d = p4d_offset(pgd, addr);
-+	pud = pud_alloc(st.mm, p4d, addr);
-+	if (!pud) {
-+		mmap_read_unlock(st.mm);
-+		return -ENOMEM;
-+	}
-+	pmd = pmd_alloc(st.mm, pud, addr);
-+	if (!pmd) {
-+		mmap_read_unlock(st.mm);
-+		return -ENOMEM;
-+	}
-+	ptep = pte_offset_map_lock(st.mm, pmd, addr, &ptl);
-+	if (!ptep) {
++	pud = pud_offset(p4d, addr);
++	pmd = pmd_offset(pud, addr);
++	ptl = pmd_lockptr(st.mm, pmd);
++	spin_lock(ptl);
++	ptep = pte_offset_map(pmd, addr);
++	if (!ptep || pte_none(*ptep)) {
++		spin_unlock(ptl);
 +		mmap_read_unlock(st.mm);
 +		return -EIO;
 +	}
 +	st.orig_pte = *ptep;
 +	st.ptep = ptep;
 +	st.ptl = ptl;
++	spin_unlock(ptl);
 +	mmap_read_unlock(st.mm);
 +	return 0;
 +}
@@ -167,16 +171,9 @@ index 0000000000000..ffba5a4ed958b
 +static int pe_thread(void *arg)
 +{
 +	struct probe_pe *pe = arg;
-+	int ret = 0;
 +
-+	/* Assigns the guard mm's ASID on this PE (check_and_switch_context). */
++	/* Assigns insmod's ASID on this PE (check_and_switch_context). */
 +	kthread_use_mm(st.mm);
-+
-+	if (pe == &st.pes[0]) {
-+		ret = guard_setup();
-+		if (ret)
-+			pr_err("guard setup failed on cpu%d: %d\n", pe->cpu, ret);
-+	}
 +	complete(&pe->ready);
 +
 +	/*
@@ -192,8 +189,8 @@ index 0000000000000..ffba5a4ed958b
 +		complete(&pe->done);
 +	}
 +
-+	kthread_unuse_mm(st.mm, NULL);
-+	return ret;
++	kthread_unuse_mm(st.mm);
++	return 0;
 +}
 +
 +/* Poke all PE kthreads, wait, return their fault flags in @faults. */
@@ -335,11 +332,9 @@ index 0000000000000..ffba5a4ed958b
 +		if (st.pes[i].tsk)
 +			kthread_stop(st.pes[i].tsk);
 +	}
-+	if (st.mm)
-+		mmput(st.mm);
 +	kfree(st.pes);
 +	st.pes = NULL;
-+	st.mm = NULL;
++	st.mm = NULL;	/* current->mm: 不持有引用, 仅清指针 */
 +}
 +
 +static int __init tlbid_probe_init(void)
@@ -379,10 +374,18 @@ index 0000000000000..ffba5a4ed958b
 +	if (!st.pes)
 +		return -ENOMEM;
 +
-+	st.mm = mm_alloc(&init_mm);
-+	if (!st.mm) {
++	/*
++	 * Reuse the insmod process's own mm: mm_alloc() is not exported to
++	 * modules, and using insmod's own ASID is exactly the zero-impact
++	 * property the probe wants.
++	 */
++	st.mm = current->mm;
++	ret = guard_setup();
++	if (ret) {
++		st.mm = NULL;
 +		kfree(st.pes);
-+		return -ENOMEM;
++		st.pes = NULL;
++		return ret;
 +	}
 +
 +	st.nr_pes = 0;
@@ -415,15 +418,9 @@ index 0000000000000..ffba5a4ed958b
 +		wake_up_process(pe->tsk);
 +	}
 +
-+	/* pes[0] sets up the guard mm mapping; wait for all to be ready. */
++	/* Wait for all PE kthreads to be up with the probe mm. */
 +	for (i = 0; i < st.nr_pes; i++)
 +		wait_for_completion(&st.pes[i].ready);
-+
-+	if (st.ptep == NULL) {
-+		pr_err("guard setup failed\n");
-+		teardown();
-+		return -EIO;
-+	}
 +
 +	st.injector = 0;
 +
